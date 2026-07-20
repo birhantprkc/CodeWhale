@@ -6,7 +6,6 @@
 
 use std::{
     fs::OpenOptions,
-    future::Future,
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
@@ -17,41 +16,50 @@ use super::*;
 
 const TOOL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Await one tool future while emitting best-effort liveness pulses.
+/// Emits delayed, best-effort liveness pulses for one running tool.
 ///
-/// The pulse is deliberately nonblocking: a full or closed UI event channel
-/// must never delay the tool itself. The first tick is consumed before the
-/// select loop so fast tools emit no heartbeat, and missed ticks are skipped
-/// instead of bursting after a temporarily starved runtime resumes.
-async fn await_tool_with_heartbeat<F, T>(tx_event: mpsc::Sender<Event>, future: F) -> T
-where
-    F: Future<Output = T>,
-{
-    await_tool_with_heartbeat_interval(tx_event, future, TOOL_HEARTBEAT_INTERVAL).await
+/// Keep the ticker in its own task instead of embedding `tokio::time::Interval`
+/// in the already-large engine turn future. Besides keeping the turn future
+/// compact, this leaves pre-execution MCP discovery and approval scheduling
+/// untouched. Dropping the guard cancels and aborts the ticker synchronously.
+struct ToolHeartbeatGuard {
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
 }
 
-async fn await_tool_with_heartbeat_interval<F, T>(
-    tx_event: mpsc::Sender<Event>,
-    future: F,
-    interval: Duration,
-) -> T
-where
-    F: Future<Output = T>,
-{
-    tokio::pin!(future);
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    ticker.tick().await;
+impl ToolHeartbeatGuard {
+    fn start(tx_event: mpsc::Sender<Event>, interval: Duration) -> Self {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Tokio intervals tick immediately once. Consume that tick so fast
+            // tools do not produce a pulse and the first heartbeat is delayed.
+            ticker.tick().await;
 
-    loop {
-        tokio::select! {
-            biased;
+            loop {
+                tokio::select! {
+                    biased;
 
-            result = &mut future => return result,
-            _ = ticker.tick() => {
-                let _ = tx_event.try_send(Event::ToolCallHeartbeat);
+                    () = task_cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        match tx_event.try_send(Event::ToolCallHeartbeat) {
+                            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                }
             }
-        }
+        });
+        Self { cancel, task }
+    }
+}
+
+impl Drop for ToolHeartbeatGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.task.abort();
     }
 }
 
@@ -353,38 +361,9 @@ impl Engine {
         mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
         context_override: Option<crate::tools::ToolContext>,
     ) -> Result<ToolResult, ToolError> {
-        let heartbeat_tx = tx_event.clone();
-        await_tool_with_heartbeat(
-            heartbeat_tx,
-            Self::execute_tool_with_lock_inner(
-                lock,
-                supports_parallel,
-                interactive,
-                tx_event,
-                tool_name,
-                tool_input,
-                workspace,
-                registry,
-                mcp_pool,
-                context_override,
-            ),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_tool_with_lock_inner(
-        lock: Arc<RwLock<()>>,
-        supports_parallel: bool,
-        interactive: bool,
-        tx_event: mpsc::Sender<Event>,
-        tool_name: String,
-        tool_input: serde_json::Value,
-        workspace: PathBuf,
-        registry: Option<&crate::tools::ToolRegistry>,
-        mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
-        context_override: Option<crate::tools::ToolContext>,
-    ) -> Result<ToolResult, ToolError> {
+        // This guard starts before lock acquisition, so contention as well as
+        // registry/MCP/interpreter execution remains visibly live.
+        let _heartbeat = ToolHeartbeatGuard::start(tx_event.clone(), TOOL_HEARTBEAT_INTERVAL);
         let started_at = std::time::Instant::now();
         let dispatch = if McpPool::is_mcp_tool(&tool_name) {
             "mcp"
@@ -494,58 +473,44 @@ mod tests {
     const TEST_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
 
     #[tokio::test]
-    async fn tool_heartbeat_emits_for_slow_future() {
+    async fn tool_heartbeat_emits_for_slow_tool() {
         let (tx, mut rx) = mpsc::channel(4);
-        let task = tokio::spawn(await_tool_with_heartbeat_interval(
-            tx,
-            async {
-                tokio::time::sleep(TEST_HEARTBEAT_INTERVAL * 3).await;
-                "done"
-            },
-            TEST_HEARTBEAT_INTERVAL,
-        ));
+        let guard = ToolHeartbeatGuard::start(tx, TEST_HEARTBEAT_INTERVAL);
 
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
-            .expect("heartbeat before slow future completes")
+            .expect("heartbeat before slow tool completes")
             .expect("event channel stays open");
+
         assert!(matches!(event, Event::ToolCallHeartbeat));
-        assert_eq!(task.await.expect("heartbeat task joined"), "done");
+        drop(guard);
     }
 
     #[tokio::test]
-    async fn tool_heartbeat_is_delayed_for_fast_future() {
+    async fn tool_heartbeat_is_delayed_for_fast_tool() {
         let (tx, mut rx) = mpsc::channel(4);
 
-        let result =
-            await_tool_with_heartbeat_interval(tx, async { "done" }, TEST_HEARTBEAT_INTERVAL).await;
+        let guard = ToolHeartbeatGuard::start(tx, TEST_HEARTBEAT_INTERVAL);
+        drop(guard);
+        tokio::time::sleep(TEST_HEARTBEAT_INTERVAL * 2).await;
 
-        assert_eq!(result, "done");
         assert!(rx.try_recv().is_err(), "fast tool emitted a heartbeat");
     }
 
     #[tokio::test]
-    async fn tool_heartbeat_stops_after_future_completes() {
+    async fn tool_heartbeat_stops_after_tool_completes() {
         let (tx, mut rx) = mpsc::channel(8);
+        let guard = ToolHeartbeatGuard::start(tx, TEST_HEARTBEAT_INTERVAL);
 
-        let result = await_tool_with_heartbeat_interval(
-            tx,
-            async {
-                tokio::time::sleep(TEST_HEARTBEAT_INTERVAL * 2).await;
-                "done"
-            },
-            TEST_HEARTBEAT_INTERVAL,
-        )
-        .await;
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("heartbeat before slow tool completes")
+            .expect("event channel stays open");
+        assert!(matches!(event, Event::ToolCallHeartbeat));
 
-        assert_eq!(result, "done");
-        let mut heartbeat_count = 0;
-        while let Ok(event) = rx.try_recv() {
-            assert!(matches!(event, Event::ToolCallHeartbeat));
-            heartbeat_count += 1;
-        }
-        assert!(heartbeat_count > 0, "slow tool emitted no heartbeat");
-
+        drop(guard);
+        tokio::task::yield_now().await;
+        while rx.try_recv().is_ok() {}
         tokio::time::sleep(TEST_HEARTBEAT_INTERVAL * 2).await;
         assert!(
             rx.try_recv().is_err(),
@@ -558,17 +523,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(Event::status("filler")).expect("fill channel");
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            await_tool_with_heartbeat_interval(
-                tx,
-                async {
-                    tokio::time::sleep(TEST_HEARTBEAT_INTERVAL * 3).await;
-                    "done"
-                },
-                TEST_HEARTBEAT_INTERVAL,
-            ),
-        )
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            let guard = ToolHeartbeatGuard::start(tx, TEST_HEARTBEAT_INTERVAL);
+            tokio::time::sleep(TEST_HEARTBEAT_INTERVAL * 3).await;
+            drop(guard);
+            "done"
+        })
         .await
         .expect("full event channel must not block tool completion");
 
